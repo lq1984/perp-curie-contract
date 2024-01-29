@@ -155,6 +155,7 @@ contract ClearingHouse is
     }
 
     /// @inheritdoc IClearingHouse
+    // 增加流动性
     function addLiquidity(AddLiquidityParams calldata params)
         external
         override
@@ -163,18 +164,33 @@ contract ClearingHouse is
         checkDeadline(params.deadline)
         returns (AddLiquidityResponse memory)
     {
+        //  struct AddLiquidityParams {
+        //        address baseToken;
+        //        uint256 base; // 添加的base token 数量
+        //        uint256 quote; // 添加的 quote token 数量
+        //        int24 lowerTick; // 价格区间lower
+        //        int24 upperTick; // 价格区间upper
+        //        uint256 minBase; // 最小的base数量
+        //        uint256 minQuote;// 最小的quote数量
+        //        bool useTakerBalance; // 默认禁用状态，这里不考虑。
+        //        uint256 deadline; // 过期时间
+        //    }
+
         // input requirement checks:
         //   baseToken: in Exchange.settleFunding()
         //   base & quote: in LiquidityAmounts.getLiquidityForAmounts() -> FullMath.mulDiv()
         //   lowerTick & upperTick: in UniswapV3Pool._modifyPosition()
         //   minBase, minQuote & deadline: here
 
+        // 确保交易对有效
         _checkMarketOpen(params.baseToken);
 
+        // 确保index price 和 mark price不能偏离超过阈值
         // This condition is to prevent the intentional bad debt attack through price manipulation.
         // CH_OMPS: Over the maximum price spread
         require(!IExchange(_exchange).isOverPriceSpread(params.baseToken), "CH_OMPS");
 
+        // 禁用状态，不考虑
         // CH_DUTB: Disable useTakerBalance
         require(!params.useTakerBalance, "CH_DUTB");
 
@@ -183,8 +199,10 @@ contract ClearingHouse is
         _registerBaseToken(trader, params.baseToken);
 
         // must settle funding first
+        // 结算资金费率
         Funding.Growth memory fundingGrowthGlobal = _settleFunding(trader, params.baseToken);
 
+        // 添加流动性
         // note that we no longer check available tokens here because CH will always auto-mint in UniswapV3MintCallback
         IOrderBook.AddLiquidityResponse memory response =
             IOrderBook(_orderBook).addLiquidity(
@@ -199,24 +217,28 @@ contract ClearingHouse is
                 })
             );
 
+        // 检查滑点
         _checkSlippageAfterLiquidityChange(response.base, params.minBase, response.quote, params.minQuote);
 
+        // 添加流动性产生的收益归用户所有，记账到已实现盈亏中
         // fees always have to be collected to owedRealizedPnl, as long as there is a change in liquidity
         _modifyOwedRealizedPnl(trader, response.fee.toInt256());
 
         // after token balances are updated, we can check if there is enough free collateral
+        // 检查可用的抵押品
         _requireEnoughFreeCollateral(trader);
 
+        // 抛事件
         _emitLiquidityChanged(
-            trader,
-            params.baseToken,
+            trader, // 添加流动性的地址
+            params.baseToken, // 交易对
             _quoteToken,
-            params.lowerTick,
-            params.upperTick,
-            response.base.toInt256(),
-            response.quote.toInt256(),
-            response.liquidity.toInt128(),
-            response.fee
+            params.lowerTick, // 流动性 lower
+            params.upperTick, // 流动性 upper
+            response.base.toInt256(), // 添加的base token数量
+            response.quote.toInt256(), // 添加的 quote token数量
+            response.liquidity.toInt128(), // 合计流动性
+            response.fee // 返回当前区间累计的手续费，如果是首次添加，那就为0
         );
 
         return
@@ -228,6 +250,7 @@ contract ClearingHouse is
             });
     }
 
+    // 移除流动性
     /// @inheritdoc IClearingHouse
     function removeLiquidity(RemoveLiquidityParams calldata params)
         external
@@ -249,8 +272,10 @@ contract ClearingHouse is
         address trader = _msgSender();
 
         // must settle funding first
+        // 结算资金费率
         _settleFunding(trader, params.baseToken);
 
+        // 调用uniswap 移除流动性
         IOrderBook.RemoveLiquidityResponse memory response =
             _removeLiquidity(
                 IOrderBook.RemoveLiquidityParams({
@@ -262,8 +287,19 @@ contract ClearingHouse is
                 })
             );
 
+        // 检查滑点
         _checkSlippageAfterLiquidityChange(response.base, params.minBase, response.quote, params.minQuote);
 
+        // 移除流动性完成订单撮合，此时更新仓位和PNL
+        // 正常情况下，
+        // 做多，也就是买入，意味着支付Quote 然后得到 Base, 所以我们就需要在Upper处添加流动性，
+        // 当价格下降到 Lower处时，添加的QuoteToken 将转换为 BaseToken, 这就类似于挂了一个限价订单然后到达具体价格后会被撮合
+        // 做空，也就是卖出，意味着支付Base 得到Quote, 所以我们就需要在Lower，处添加流动性
+        // 当价格上升到 Upper处时，添加的BaseToken 将转换为 QuoteToken, 这就相当于撮合成功
+
+        // 当移除流动性的时候，base 和 quote token亏损
+        // response.takerBase 有可能是正数也有可能是负数
+        // response.takerQuote 有可能是正数也有可能是负数
         _modifyPositionAndRealizePnl(
             trader,
             params.baseToken,
@@ -288,19 +324,23 @@ contract ClearingHouse is
         return RemoveLiquidityResponse({ quote: response.quote, base: response.base, fee: response.fee });
     }
 
+    // 结算trader 所有仓位的资金费
     /// @inheritdoc IClearingHouse
     function settleAllFunding(address trader) external override {
         // only vault or trader
         // vault must check msg.sender == trader when calling settleAllFunding
         require(_msgSender() == _vault || _msgSender() == trader, "CH_OVOT");
 
+        // 获取地址所有持仓的交易对
         address[] memory baseTokens = IAccountBalance(_accountBalance).getBaseTokens(trader);
         uint256 baseTokenLength = baseTokens.length;
         for (uint256 i = 0; i < baseTokenLength; i++) {
+            // 结算单个交易对资金费
             _settleFunding(trader, baseTokens[i]);
         }
     }
 
+    // 开仓
     /// @inheritdoc IClearingHouse
     function openPosition(OpenPositionParams memory params)
         external
@@ -315,6 +355,7 @@ contract ClearingHouse is
         return (base, quote);
     }
 
+    // 开仓
     /// @inheritdoc IClearingHouse
     function openPositionFor(address trader, OpenPositionParams memory params)
         external
@@ -334,6 +375,7 @@ contract ClearingHouse is
         return _openPositionFor(trader, params);
     }
 
+    // 平仓
     /// @inheritdoc IClearingHouse
     function closePosition(ClosePositionParams calldata params)
         external
@@ -350,13 +392,16 @@ contract ClearingHouse is
         //   deadline: here
         //   referralCode: X
 
+        // 确保交易对开放
         _checkMarketOpen(params.baseToken);
 
         address trader = _msgSender();
 
+        // 先结算累计的资金费
         // must settle funding first
         _settleFunding(trader, params.baseToken);
 
+        // 这里是获取用户当前的持仓数量，这个持仓数量只是taker的，不包含maker的
         int256 positionSize = _getTakerPositionSafe(trader, params.baseToken);
         uint256 positionSizeAbs = positionSize.abs();
 
@@ -364,6 +409,7 @@ contract ClearingHouse is
         // old position is short. when closing, it's quoteToBase && exactOutput (buy exact base back)
         bool isBaseToQuote = positionSize > 0;
 
+        // 反向订单去平仓
         IExchange.SwapResponse memory response =
             _openPosition(
                 InternalOpenPositionParams({
@@ -377,6 +423,7 @@ contract ClearingHouse is
                 })
             );
 
+        // 检查滑点
         _checkSlippage(
             InternalCheckSlippageParams({
                 isBaseToQuote: isBaseToQuote,
@@ -389,11 +436,13 @@ contract ClearingHouse is
             })
         );
 
+        // 邀请奖励相关
         _referredPositionChanged(params.referralCode);
 
         return (response.base, response.quote);
     }
 
+    // 清算
     /// @inheritdoc IClearingHouse
     function liquidate(
         address trader,
@@ -403,12 +452,14 @@ contract ClearingHouse is
         _liquidate(trader, baseToken, positionSize);
     }
 
+    // 清算
     /// @inheritdoc IClearingHouse
     function liquidate(address trader, address baseToken) external override whenNotPaused nonReentrant {
         // positionSizeToBeLiquidated = 0 means liquidating as much as possible
         _liquidate(trader, baseToken, 0);
     }
 
+    // 取消未完成的maker订单, 这个是给清算人用的
     /// @inheritdoc IClearingHouse
     function cancelExcessOrders(
         address maker,
@@ -423,6 +474,7 @@ contract ClearingHouse is
         _cancelExcessOrders(maker, baseToken, orderIds);
     }
 
+    // 取消未完成的maker订单, 这个是给清算人用的
     /// @inheritdoc IClearingHouse
     function cancelAllExcessOrders(address maker, address baseToken) external override whenNotPaused nonReentrant {
         // input requirement checks:
@@ -469,6 +521,7 @@ contract ClearingHouse is
         return (positionSize.abs(), positionNotional.abs());
     }
 
+    // uniswapV3 mint回调，这里是直接mint virtual token
     /// @inheritdoc IUniswapV3MintCallback
     /// @dev namings here follow Uniswap's convention
     function uniswapV3MintCallback(
@@ -498,6 +551,7 @@ contract ClearingHouse is
         }
     }
 
+    // uniswapV3 swap回调
     /// @inheritdoc IUniswapV3SwapCallback
     /// @dev namings here follow Uniswap's convention
     function uniswapV3SwapCallback(
@@ -597,6 +651,7 @@ contract ClearingHouse is
         require(IERC20Metadata(token).transfer(to, amount), "CH_TF");
     }
 
+    // 清算
     function _liquidate(
         address trader,
         address baseToken,
@@ -610,6 +665,7 @@ contract ClearingHouse is
         // CH_EAV: enough account value
         require(_isLiquidatable(trader), "CH_EAV");
 
+        // 获取当前持仓大小
         int256 positionSize = _getTakerPositionSafe(trader, baseToken);
 
         // CH_WLD: wrong liquidation direction
@@ -619,17 +675,22 @@ contract ClearingHouse is
 
         _registerBaseToken(liquidator, baseToken);
 
+        // 计算trader 和 liquidator的资金费
         // must settle funding first
         _settleFunding(trader, baseToken);
         _settleFunding(liquidator, baseToken);
 
+        // 获取当前trader的价值
         int256 accountValue = getAccountValue(trader);
 
         // trader's position is closed at index price and pnl realized
+
+        // 计算被清算的仓位大小，以及名义价值
         (int256 liquidatedPositionSize, int256 liquidatedPositionNotional) =
             _getLiquidatedPositionSizeAndNotional(trader, baseToken, accountValue, positionSizeToBeLiquidated);
         _modifyPositionAndRealizePnl(trader, baseToken, liquidatedPositionSize, liquidatedPositionNotional, 0, 0);
 
+        // 计算清算罚金
         // trader pays liquidation penalty
         uint256 liquidationPenalty = liquidatedPositionNotional.abs().mulRatio(_getLiquidationPenaltyRatio());
         _modifyOwedRealizedPnl(trader, liquidationPenalty.neg256());
@@ -637,6 +698,8 @@ contract ClearingHouse is
         address insuranceFund = _insuranceFund;
 
         // if there is bad debt, liquidation fees all go to liquidator; otherwise, split between liquidator & IF
+
+        // 清算罚金一半给清算人，一半给风险保证金，如果穿仓，那么清算人盈利由风险保证金支付
         uint256 liquidationFeeToLiquidator = liquidationPenalty.div(2);
         uint256 liquidationFeeToIF;
         if (accountValue < 0) {
@@ -646,6 +709,7 @@ contract ClearingHouse is
             _modifyOwedRealizedPnl(insuranceFund, liquidationFeeToIF.toInt256());
         }
 
+        // 检查穿仓情况
         // assume there is no longer any unsettled bad debt in the system
         // (so that true IF capacity = accountValue(IF) + USDC.balanceOf(IF))
         // if trader's account value becomes negative, the amount is the bad debt IF must have enough capacity to cover
@@ -663,12 +727,15 @@ contract ClearingHouse is
             }
         }
 
+        // 在这里更新清算人的仓位
+
         // liquidator opens a position with liquidationFeeToLiquidator as a discount
         // liquidator's openNotional = -liquidatedPositionNotional + liquidationFeeToLiquidator
         int256 liquidatorExchangedPositionSize = liquidatedPositionSize.neg256();
         int256 liquidatorExchangedPositionNotional =
             liquidatedPositionNotional.neg256().add(liquidationFeeToLiquidator.toInt256());
         // note that this function will realize pnl if it's reducing liquidator's existing position size
+        // 更新清算人仓位和PNL
         _modifyPositionAndRealizePnl(
             liquidator,
             baseToken,
@@ -689,6 +756,7 @@ contract ClearingHouse is
             liquidator
         );
 
+        // 结算债务
         _settleBadDebt(trader);
     }
 
@@ -738,6 +806,7 @@ contract ClearingHouse is
         );
     }
 
+    // 取消未完成的maker订单, 这个是给清算人用的
     /// @dev only cancel open orders if there are not enough free collateral with mmRatio
     /// or account is able to being liquidated.
     function _cancelExcessOrders(
@@ -752,6 +821,7 @@ contract ClearingHouse is
         }
 
         // CH_NEXO: not excess orders
+        // 如果仓位待清算 或者保证金足够，那就不允许取消
         require(
             (_getFreeCollateralByRatio(maker, IClearingHouseConfig(_clearingHouseConfig).getMmRatio()) < 0) ||
                 _isLiquidatable(maker),
@@ -760,6 +830,8 @@ contract ClearingHouse is
 
         // must settle funding first
         _settleFunding(maker, baseToken);
+
+        // 移除所有流动性, 将maker仓位转换为永久仓位，一边进行下一步清算
 
         // remove all orders in internal function
         _removeAllLiquidity(maker, baseToken, orderIds);
@@ -825,9 +897,11 @@ contract ClearingHouse is
     /// @dev explainer diagram for the relationship between exchangedPositionNotional, fee and openNotional:
     ///      https://www.figma.com/file/xuue5qGH4RalX7uAbbzgP3/swap-accounting-and-events
     function _openPosition(InternalOpenPositionParams memory params) internal returns (IExchange.SwapResponse memory) {
+        // 撮合前先获取仓位大小
         int256 takerPositionSizeBeforeSwap =
             IAccountBalance(_accountBalance).getTakerPositionSize(params.trader, params.baseToken);
 
+        // 开始撮合
         IExchange.SwapResponse memory response =
             IExchange(_exchange).swap(
                 IExchange.SwapParams({
@@ -841,15 +915,17 @@ contract ClearingHouse is
                 })
             );
 
+        // 修改风险保证金
         _modifyOwedRealizedPnl(_insuranceFund, response.insuranceFundFee.toInt256());
 
+        // 结算资金
         // examples:
         // https://www.figma.com/file/xuue5qGH4RalX7uAbbzgP3/swap-accounting-and-events?node-id=0%3A1
         _settleBalanceAndDeregister(
             params.trader,
             params.baseToken,
-            response.exchangedPositionSize,
-            response.exchangedPositionNotional.sub(response.fee.toInt256()),
+            response.exchangedPositionSize, // base
+            response.exchangedPositionNotional.sub(response.fee.toInt256()), // quote
             response.pnlToBeRealized,
             0
         );
@@ -887,14 +963,14 @@ contract ClearingHouse is
         // openNotional will be zero if baseToken is deregistered from trader's token list.
         int256 openNotional = _getTakerOpenNotional(params.trader, params.baseToken);
         _emitPositionChanged(
-            params.trader,
-            params.baseToken,
-            response.exchangedPositionSize,
-            response.exchangedPositionNotional,
-            response.fee,
-            openNotional,
-            response.pnlToBeRealized, // realizedPnl
-            response.sqrtPriceAfterX96
+            params.trader, // 用户地址
+            params.baseToken, // 交易对
+            response.exchangedPositionSize, // 本次开仓加仓大小
+            response.exchangedPositionNotional, // 增加的本金数量
+            response.fee, // 交易手续费
+            openNotional, // 开仓加仓后本金的数量
+            response.pnlToBeRealized, // realizedPnl 已实现盈亏，如果是平仓的话
+            response.sqrtPriceAfterX96 // 成交后 池子的价格
         );
 
         return response;
@@ -938,6 +1014,7 @@ contract ClearingHouse is
                 })
             );
 
+        // 检查滑点
         _checkSlippage(
             InternalCheckSlippageParams({
                 isBaseToQuote: params.isBaseToQuote,

@@ -11,13 +11,15 @@ abstract contract AccountBalanceStorageV1 {
     address internal _orderBook;
     address internal _vault;
 
-    // trader => owedRealizedPnl
+    // trader => owedRealizedPnl  已实现盈亏记账
     mapping(address => int256) internal _owedRealizedPnlMap;
 
+    // 当前trader 持有仓位的token列表
     // trader => baseTokens
     // base token registry of each trader
     mapping(address => address[]) internal _baseTokensMap;
 
-    // first key: trader, second key: baseToken
+    // 存放taker仓位信息
+    // first key: trader, second key: baseToken 仓位信息
     mapping(address => mapping(address => AccountMarket.Info)) internal _accountMarketMap;
 }

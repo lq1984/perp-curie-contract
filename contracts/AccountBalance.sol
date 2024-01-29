@@ -72,6 +72,7 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
         return _modifyTakerBalance(trader, baseToken, base, quote);
     }
 
+    // 修改累积的已实现盈亏
     /// @inheritdoc IAccountBalance
     function modifyOwedRealizedPnl(address trader, int256 amount) external override {
         _requireOnlyClearingHouse();
@@ -102,18 +103,29 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
     function settleBalanceAndDeregister(
         address trader,
         address baseToken,
+
+    // long:  exchangedPositionSize >= 0 && exchangedPositionNotional <= 0
+    // short: exchangedPositionSize <= 0 && exchangedPositionNotional >= 0
         int256 takerBase,
         int256 takerQuote,
-        int256 realizedPnl,
-        int256 makerFee
+        int256 realizedPnl, // PNL
+        int256 makerFee // 手续费
     ) external override {
         _requireOnlyClearingHouse();
+
+        // 记账 positionSize
         _modifyTakerBalance(trader, baseToken, takerBase, takerQuote);
+
+        // 记账手续费
         _modifyOwedRealizedPnl(trader, makerFee);
 
         // @audit should merge _addOwedRealizedPnl and settleQuoteToOwedRealizedPnl in some way.
         // PnlRealized will be emitted three times when removing trader's liquidity
+
+        // 结算quote token 给用户, 这里也只是记账
         _settleQuoteToOwedRealizedPnl(trader, baseToken, realizedPnl);
+
+        //
         _deregisterBaseToken(trader, baseToken);
     }
 
@@ -213,11 +225,13 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
         return _accountMarketMap[trader][baseToken].takerOpenNotional;
     }
 
+    // quoteInPool - orderQuoteDebt + takerOpenNotional
     // @inheritdoc IAccountBalance
     function getTotalOpenNotional(address trader, address baseToken) external view override returns (int256) {
         // quote.pool[baseToken] + quoteBalance[baseToken]
         (uint256 quoteInPool, ) =
             IOrderBook(_orderBook).getTotalTokenAmountInPoolAndPendingFee(trader, baseToken, false);
+
         int256 quoteBalance = getQuote(trader, baseToken);
         return quoteInPool.toInt256().add(quoteBalance);
     }
@@ -229,6 +243,7 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
         uint256 tokenLen = _baseTokensMap[trader].length;
         for (uint256 i = 0; i < tokenLen; i++) {
             address baseToken = _baseTokensMap[trader][i];
+            // baseBalance = takerPositionSize - orderBaseDebt
             int256 baseBalance = getBase(trader, baseToken);
             int256 baseDebtValue;
             // baseDebt = baseBalance when it's negative
@@ -239,6 +254,7 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
             totalBaseDebtValue = totalBaseDebtValue.add(baseDebtValue);
 
             // we can't calculate totalQuoteDebtValue until we have totalQuoteBalance
+            // takerOpenNotional - orderQuoteDebt
             totalQuoteBalance = totalQuoteBalance.add(getQuote(trader, baseToken));
         }
         int256 totalQuoteDebtValue = totalQuoteBalance >= 0 ? 0 : totalQuoteBalance;
@@ -265,6 +281,7 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
             totalPositionValue = totalPositionValue.add(getTotalPositionValue(trader, baseToken));
         }
         (int256 netQuoteBalance, uint256 pendingFee) = _getNetQuoteBalanceAndPendingFee(trader);
+        // 这里之所以是加法是因为 netQuoteBalance 中包含了 PositionOpenNotinal 这个数值是相反的
         int256 unrealizedPnl = totalPositionValue.add(netQuoteBalance);
 
         return (_owedRealizedPnlMap[trader], unrealizedPnl, pendingFee);
@@ -288,22 +305,29 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
         return IOrderBook(_orderBook).hasOrder(trader, tokens);
     }
 
+    // 计算可以清算的仓位大小
     /// @inheritdoc IAccountBalance
     function getLiquidatablePositionSize(
         address trader,
         address baseToken,
         int256 accountValue
     ) external view override returns (int256) {
+        // 维持保证金
         int256 marginRequirement = getMarginRequirementForLiquidation(trader);
+
+        // 持仓大小
         int256 positionSize = getTotalPositionSize(trader, baseToken);
 
         // No liquidatable position
+        // 账户余额足够或者没有持仓，那就不需要清算
         if (accountValue >= marginRequirement || positionSize == 0) {
             return 0;
         }
 
         // Liquidate the entire position if its value is small enough
         // to prevent tiny positions left in the system
+
+        // 如果仓位小于100USD 那么直接清算全部数量
         uint256 positionValueAbs = _getPositionValue(baseToken, positionSize).abs();
         if (positionValueAbs <= _MIN_PARTIAL_LIQUIDATE_POSITION_VALUE) {
             return positionSize;
@@ -355,35 +379,42 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
         return _accountMarketMap[trader][baseToken].takerOpenNotional.sub(orderDebt.toInt256());
     }
 
+    // 获取taker持仓大小
     /// @inheritdoc IAccountBalance
     function getTakerPositionSize(address trader, address baseToken) public view override returns (int256) {
         int256 positionSize = _accountMarketMap[trader][baseToken].takerPositionSize;
         return positionSize.abs() < _DUST ? 0 : positionSize;
     }
 
+    // 获取某一个交易对总共仓位大小，包含当前持仓，以及 Impermanent Position Size
     /// @inheritdoc IAccountBalance
     function getTotalPositionSize(address trader, address baseToken) public view override returns (int256) {
         // NOTE: when a token goes into UniswapV3 pool (addLiquidity or swap), there would be 1 wei rounding error
         // for instance, maker adds liquidity with 2 base (2000000000000000000),
         // the actual base amount in pool would be 1999999999999999999
 
+
+        // 获取池子中的 Impermanent Position Size
         // makerBalance = totalTokenAmountInPool - totalOrderDebt
         (uint256 totalBaseBalanceFromOrders, ) =
             IOrderBook(_orderBook).getTotalTokenAmountInPoolAndPendingFee(trader, baseToken, true);
         uint256 totalBaseDebtFromOrder = IOrderBook(_orderBook).getTotalOrderDebt(trader, baseToken, true);
         int256 makerBaseBalance = totalBaseBalanceFromOrders.toInt256().sub(totalBaseDebtFromOrder.toInt256());
 
+        // 获取当前实际持仓数量大小
         int256 takerPositionSize = _accountMarketMap[trader][baseToken].takerPositionSize;
         int256 totalPositionSize = makerBaseBalance.add(takerPositionSize);
         return totalPositionSize.abs() < _DUST ? 0 : totalPositionSize;
     }
 
+    // 获取某一个交易对下总共仓位的名义价值
     /// @inheritdoc IAccountBalance
     function getTotalPositionValue(address trader, address baseToken) public view override returns (int256) {
         int256 positionSize = getTotalPositionSize(trader, baseToken);
         return _getPositionValue(baseToken, positionSize);
     }
 
+    // 获取所有所有交易对的仓位名义价值总和
     /// @inheritdoc IAccountBalance
     function getTotalAbsPositionValue(address trader) public view override returns (uint256) {
         address[] memory tokens = _baseTokensMap[trader];
@@ -398,6 +429,7 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
         return totalPositionValue;
     }
 
+    // 获取维持保证金，用于清算
     /// @inheritdoc IAccountBalance
     function getMarginRequirementForLiquidation(address trader) public view override returns (int256) {
         return
@@ -409,11 +441,12 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
     //
     // INTERNAL NON-VIEW
     //
+    // 修改taker的仓位
     function _modifyTakerBalance(
         address trader,
         address baseToken,
-        int256 base,
-        int256 quote
+        int256 base, // base的数量
+        int256 quote // quote的数量
     ) internal returns (int256, int256) {
         AccountMarket.Info storage accountInfo = _accountMarketMap[trader][baseToken];
         accountInfo.takerPositionSize = accountInfo.takerPositionSize.add(base);
@@ -421,6 +454,7 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
         return (accountInfo.takerPositionSize, accountInfo.takerOpenNotional);
     }
 
+    // 更新用户已经累计的已实现盈亏, 也是记账
     function _modifyOwedRealizedPnl(address trader, int256 amount) internal {
         if (amount != 0) {
             _owedRealizedPnlMap[trader] = _owedRealizedPnlMap[trader].add(amount);
@@ -428,6 +462,7 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
         }
     }
 
+    // 结算PNL给用户
     function _settleQuoteToOwedRealizedPnl(
         address trader,
         address baseToken,
@@ -435,11 +470,13 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
     ) internal {
         if (amount != 0) {
             AccountMarket.Info storage accountInfo = _accountMarketMap[trader][baseToken];
+            // 更新本金
             accountInfo.takerOpenNotional = accountInfo.takerOpenNotional.sub(amount);
             _modifyOwedRealizedPnl(trader, amount);
         }
     }
 
+    // 清空持仓信息, 以及range order
     /// @dev this function is expensive
     function _deregisterBaseToken(address trader, address baseToken) internal {
         AccountMarket.Info memory info = _accountMarketMap[trader][baseToken];
@@ -476,6 +513,7 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
     // INTERNAL VIEW
     //
 
+    // 计算名义仓位名义价值
     function _getPositionValue(address baseToken, int256 positionSize) internal view returns (int256) {
         if (positionSize == 0) return 0;
 
@@ -486,23 +524,28 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
         return positionSize.mulDiv(price.toInt256(), 1e18);
     }
 
+    // 获取token对应的价格
     function _getReferencePrice(address baseToken) internal view returns (uint256) {
         if (IBaseToken(baseToken).isOpen()) {
+            // 获取标记价格
             return _getMarkPrice(baseToken);
         }
 
+        // 如果是close状态，那就获取closePrice, 否则获取Paused 指数价格
         return
             IBaseToken(baseToken).isClosed()
                 ? IBaseToken(baseToken).getClosedPrice()
                 : IBaseToken(baseToken).getPausedIndexPrice();
     }
 
+    // netQuoteBalance = 仓位开仓加仓名义价值 + 池子总共的quote tokens
     /// @return netQuoteBalance = quote.balance + totalQuoteInPools
     function _getNetQuoteBalanceAndPendingFee(address trader)
         internal
         view
         returns (int256 netQuoteBalance, uint256 pendingFee)
     {
+        // 仓位开仓加仓名义价值
         int256 totalTakerQuoteBalance;
         uint256 tokenLen = _baseTokensMap[trader].length;
         for (uint256 i = 0; i < tokenLen; i++) {
@@ -512,6 +555,7 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
 
         // pendingFee is included
         int256 totalMakerQuoteBalance;
+        // 获取当地址对应所有限价订单可以的余额 与 为结算的uniswap 交易手续费
         (totalMakerQuoteBalance, pendingFee) = IOrderBook(_orderBook).getTotalQuoteBalanceAndPendingFee(
             trader,
             _baseTokensMap[trader]
@@ -521,6 +565,7 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
         return (netQuoteBalance, pendingFee);
     }
 
+    // 获取标记价格，实时计算
     function _getMarkPrice(address baseToken) internal view virtual returns (uint256) {
         IClearingHouseConfig clearingHouseConfig = IClearingHouseConfig(_clearingHouseConfig);
         (uint32 marketTwapInterval, uint32 premiumInterval) = clearingHouseConfig.getMarkPriceConfig();
@@ -537,6 +582,7 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
         return PerpMath.findMedianOfThree(marketPrice, marketTwap, indexWithPremium);
     }
 
+    // 获取当前市场的价格
     function _getMarketPrice(address baseToken, uint32 twapInterval) internal view returns (uint256) {
         return
             IExchange(IOrderBook(_orderBook).getExchange())
@@ -545,6 +591,7 @@ contract AccountBalance is IAccountBalance, BlockContext, ClearingHouseCallee, A
                 .formatX96ToX10_18();
     }
 
+    // 获取外部市场价格，也就是指数价格
     function _getIndexPrice(address baseToken, uint32 twapInterval) internal view returns (uint256) {
         return IIndexPrice(baseToken).getIndexPrice(twapInterval);
     }

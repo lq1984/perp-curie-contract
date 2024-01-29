@@ -129,6 +129,7 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         emit WETH9Changed(WETH9Arg);
     }
 
+    // 用户充值
     /// @inheritdoc IVault
     function deposit(address token, uint256 amount)
         external
@@ -145,6 +146,7 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         _deposit(from, from, token, amount);
     }
 
+    // 充值
     /// @inheritdoc IVault
     function depositFor(
         address to,
@@ -162,12 +164,14 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         _deposit(from, to, token, amount);
     }
 
+    // 充值ETH
     /// @inheritdoc IVault
     function depositEther() external payable override whenNotPaused nonReentrant {
         address to = _msgSender();
         _depositEther(to);
     }
 
+    // 充值ETH
     /// @inheritdoc IVault
     function depositEtherFor(address to) external payable override whenNotPaused nonReentrant {
         // input requirement checks:
@@ -178,6 +182,7 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         _depositEther(to);
     }
 
+    // 提现
     /// @inheritdoc IVault
     // the full process of withdrawal:
     // 1. settle funding payment to owedRealizedPnl
@@ -200,6 +205,7 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         _withdraw(to, token, amount);
     }
 
+    // 提现
     /// @inheritdoc IVault
     function withdrawEther(uint256 amount) external override whenNotPaused nonReentrant {
         // input requirement checks:
@@ -212,6 +218,7 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         _withdrawEther(to, amount);
     }
 
+    // 提现所有
     /// @inheritdoc IVault
     function withdrawAll(address token)
         external
@@ -225,12 +232,14 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         //   token: here
 
         address to = _msgSender();
+        // 计算未使用的抵押品数量
         amount = getFreeCollateralByToken(to, token);
 
         _withdraw(to, token, amount);
         return amount;
     }
 
+    // 提现所有ETH
     /// @inheritdoc IVault
     function withdrawAllEther() external override whenNotPaused nonReentrant returns (uint256 amount) {
         _requireWETH9IsCollateral();
@@ -242,7 +251,16 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         return amount;
     }
 
-    /// @inheritdoc IVault
+    /// @notice Liquidate trader's collateral by given settlement token amount or non settlement token amount
+    //  给定结算token的数量 结算抵押品
+    /// @param trader The address of trader that will be liquidated
+    /// @param token The address of non settlement collateral token that the trader will be liquidated   需要被清算的抵押品
+    /// @param amount The amount of settlement token that the liquidator will repay for trader or  抵押品数量
+    ///               the amount of non-settlement collateral token that the liquidator will charge from trader
+    /// @param isDenominatedInSettlementToken Whether the amount is denominated in settlement token or not 返回值是否以结算token计价
+    /// @return returnAmount The amount of a non-settlement token (in its native decimals) that is liquidated
+    ///         when `isDenominatedInSettlementToken` is true or the amount of settlement token that is repaid
+    ///         when `isDenominatedInSettlementToken` is false
     function liquidateCollateral(
         address trader,
         address token,
@@ -266,12 +284,15 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         uint256 returnAmount;
 
         if (isDenominatedInSettlementToken) {
+            // 以结算token计价
             settlementX10_S = amount;
             // V_MSAE: Maximum settlement amount exceeded
             require(settlementX10_S <= maxRepaidSettlementX10_S, "V_MSAE");
+
             collateral = settlementX10_S == maxRepaidSettlementX10_S
                 ? maxLiquidatableCollateral
                 : getLiquidatableCollateralBySettlement(token, settlementX10_S);
+
             returnAmount = collateral;
         } else {
             collateral = amount;
@@ -372,16 +393,19 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
     // PUBLIC VIEW
     //
 
+    // 获取结算token的余额
     /// @inheritdoc IVault
     function getBalance(address trader) public view override returns (int256) {
         return _balance[trader][_settlementToken];
     }
 
+    // 获取具体token的余额
     /// @inheritdoc IVault
     function getBalanceByToken(address trader, address token) public view override returns (int256) {
         return _balance[trader][token];
     }
 
+    // 获取所有未使用的抵押品
     /// @inheritdoc IVault
     /// @dev getFreeCollateralByToken(token) = (getSettlementTokenValue() >= 0)
     ///   ? min(getFreeCollateral() / indexPrice[token], getBalanceByToken(token))
@@ -393,13 +417,17 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
             return 0;
         }
 
+        // 获取可用的抵押品数量，TODO
         uint256 freeCollateralX10_18 = _getFreeCollateral(trader);
         if (freeCollateralX10_18 == 0) {
             return 0;
         }
 
+        // 如果是结算token,那么直接获取已结算的token 余额
         if (token == _settlementToken) {
             (int256 settlementTokenBalanceX10_18, ) = _getSettlementTokenBalanceAndUnrealizedPnl(trader);
+
+            // return min(freeCollateralX10_18,settlementTokenBalanceX10_18)
             return
                 settlementTokenBalanceX10_18 <= 0
                     ? 0
@@ -408,7 +436,9 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
                         .formatSettlementToken(_decimals);
         }
 
+        // 查询计算token的价格， 下面需要进行换算
         (uint256 indexTwap, uint8 priceFeedDecimals) = _getIndexPriceAndDecimals(token);
+
         uint24 collateralRatio = ICollateralManager(_collateralManager).getCollateralConfig(token).collateralRatio;
         return
             MathUpgradeable.min(
@@ -420,22 +450,32 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
             );
     }
 
+    // 是否达到清算条件
     /// @inheritdoc IVault
     function isLiquidatable(address trader) public view override returns (bool) {
         address[] storage collateralTokens = _collateralTokensMap[trader];
+        // 说明没持有仓位
         if (collateralTokens.length == 0) {
             return false;
         }
 
+        // 获取当前账号对应的 accountValue，也就是持仓资产的所有名义价值
         (int256 accountValueX10_18, ) = _getAccountValueAndTotalCollateralValue(trader);
+
+        //
+        // 判断当前当前可用余额是否大于等于维持保证金
         if (accountValueX10_18 < getMarginRequirementForCollateralLiquidation(trader)) {
             return true;
         }
 
+        // 结算token的价值
         int256 settlementTokenValueX10_18 = _getSettlementTokenValue(trader);
+
+        // 结算token的负债
         uint256 settlementTokenDebtX10_18 =
             settlementTokenValueX10_18 < 0 ? settlementTokenValueX10_18.neg256().toUint256() : 0;
 
+        //
         if (
             settlementTokenDebtX10_18 >
             _getNonSettlementTokenValue(trader).mulRatio(
@@ -455,6 +495,8 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         return false;
     }
 
+    // 计算维持保证金
+    // 也就是维持当前仓位至少需要的保证金数量
     /// @inheritdoc IVault
     function getMarginRequirementForCollateralLiquidation(address trader) public view override returns (int256) {
         return
@@ -572,8 +614,12 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
             return;
         }
 
+        // 假设trader没有仓位 也没有抵押非结算token
+
         // assume trader has no position and no non-settlement collateral
         // so accountValue = settlement token balance
+
+        // 所以当前账号价值就是持有的USDC价值
         (int256 accountValueX10_18, ) = _getSettlementTokenBalanceAndUnrealizedPnl(trader);
         int256 accountValueX10_S = accountValueX10_18.formatSettlementToken(_decimals);
 
@@ -584,6 +630,8 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         // settle bad debt for trader
         int256 badDebt = accountValueX10_S.neg256();
         address settlementToken = _settlementToken; // SLOAD gas saving
+
+        // 使用风险保证金填补这一部分？ 为什么？
         _modifyBalance(_insuranceFund, settlementToken, accountValueX10_S);
         _modifyBalance(trader, settlementToken, badDebt);
 
@@ -604,16 +652,18 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         uint256 amount
     ) internal {
         // check for deflationary tokens by assuring balances before and after transferring to be the same
+        // 转账
         uint256 balanceBefore = IERC20Metadata(token).balanceOf(address(this));
         SafeERC20Upgradeable.safeTransferFrom(IERC20Upgradeable(token), from, address(this), amount);
         // V_IBA: inconsistent balance amount, to prevent from deflationary tokens
         require((IERC20Metadata(token).balanceOf(address(this)).sub(balanceBefore)) == amount, "V_IBA");
     }
 
+    // 充值
     /// @param from deposit token from this address
     /// @param to deposit token to this address
-    /// @param token the collateral token wish to deposit
-    /// @param amount the amount of token to deposit
+    /// @param token the collateral token wish to deposit 需要充值的token
+    /// @param amount the amount of token to deposit 充值的数量
     function _deposit(
         address from,
         address to,
@@ -623,6 +673,7 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         // V_ZA: Zero amount
         require(amount > 0, "V_ZA");
         _transferTokenIn(token, from, amount);
+        // 检查充值上限, 并且记账
         _checkDepositCapAndRegister(token, to, amount);
     }
 
@@ -649,16 +700,19 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         uint256 amount
     ) internal {
         if (token == _settlementToken) {
+            // 如果是结算token 那么则检查结算token的上限
             uint256 settlementTokenBalanceCap =
                 IClearingHouseConfig(_clearingHouseConfig).getSettlementTokenBalanceCap();
             // V_GTSTBC: greater than settlement token balance cap
             require(IERC20Metadata(token).balanceOf(address(this)) <= settlementTokenBalanceCap, "V_GTSTBC");
         } else {
+            // 如果是其它token，则从其它配置中获取上限
             uint256 depositCap = ICollateralManager(_collateralManager).getCollateralConfig(token).depositCap;
             // V_GTDC: greater than deposit cap
             require(IERC20Metadata(token).balanceOf(address(this)) <= depositCap, "V_GTDC");
         }
 
+        // 记账
         _modifyBalance(to, token, amount.toInt256());
         emit Deposited(token, to, amount);
     }
@@ -687,16 +741,21 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         _modifyBalance(to, token, deltaBalance);
     }
 
+    // 提现token
     function _withdraw(
         address to,
         address token,
         uint256 amount
     ) internal {
+        // 记账
         _settleAndDecreaseBalance(to, token, amount);
+
+        // 转账
         SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(token), to, amount);
         emit Withdrawn(token, to, amount);
     }
 
+    // 提现ETH
     function _withdrawEther(address to, uint256 amount) internal {
         // SLOAD for gas saving
         address WETH9 = _WETH9;
@@ -709,6 +768,7 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
     }
 
     /// @param amount can be 0; do not require this
+    // 记账
     function _modifyBalance(
         address trader,
         address token,
@@ -718,16 +778,24 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
             return;
         }
 
+        // 记账
         int256 oldBalance = _balance[trader][token];
         int256 newBalance = oldBalance.add(amount);
         _balance[trader][token] = newBalance;
 
+        // 如果是结算token 那么直接返回
         if (token == _settlementToken) {
             return;
         }
 
+        // 下面的逻辑是为了 非结算的token
+
         // register/deregister non-settlement collateral tokens
         if (oldBalance != 0 && newBalance == 0) {
+            // oldBalance 不为 0， 但newBalance为0 ，所以该用户的这个token之前是负数（穿仓 ）
+            // 现在用户又充钱把亏损填了, 此时余额为0,所以需要从抵押token列表中移除token
+
+            // 遍历抵押token列表
             address[] storage collateralTokens = _collateralTokensMap[trader];
             uint256 tokenLen = collateralTokens.length;
             uint256 lastTokenIndex = tokenLen - 1;
@@ -738,13 +806,19 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
                     if (i != lastTokenIndex) {
                         collateralTokens[i] = collateralTokens[lastTokenIndex];
                     }
+                    // 从抵押token列表移除抵押token
                     collateralTokens.pop();
                     break;
                 }
             }
         } else if (oldBalance == 0 && newBalance != 0) {
+            // 第一次充钱
+            // 注册抵押token
             address[] storage collateralTokens = _collateralTokensMap[trader];
             collateralTokens.push(token);
+
+            // 检查持有token种类数量上限
+
             // V_CTNE: collateral tokens number exceeded
             require(
                 collateralTokens.length <= ICollateralManager(_collateralManager).getMaxCollateralTokensPerAccount(),
@@ -812,6 +886,8 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
                 .toUint256();
     }
 
+    // 获取可用的抵押品数量
+    // radio 为维持保证金率
     function _getFreeCollateralByRatio(address trader, uint24 ratio)
         internal
         view
@@ -820,6 +896,8 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         // conservative config: freeCollateral = min(totalCollateralValue, accountValue) - openOrderMarginReq
         (int256 accountValueX10_18, int256 totalCollateralValueX10_18) =
             _getAccountValueAndTotalCollateralValue(trader);
+
+        // 计算维持保证金
         uint256 totalMarginRequirementX10_18 = _getTotalMarginRequirement(trader, ratio);
 
         return
@@ -845,7 +923,11 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         returns (int256 totalCollateralValueX10_18, int256 unrealizedPnlX10_18)
     {
         int256 settlementTokenBalanceX10_18;
+
+        // 结算Token的balance, 未实现盈亏
         (settlementTokenBalanceX10_18, unrealizedPnlX10_18) = _getSettlementTokenBalanceAndUnrealizedPnl(trader);
+
+        // 非结算token的价值
         uint256 nonSettlementTokenValueX10_18 = _getNonSettlementTokenValue(trader);
         return (nonSettlementTokenValueX10_18.toInt256().add(settlementTokenBalanceX10_18), unrealizedPnlX10_18);
     }
@@ -863,13 +945,17 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         view
         returns (int256 settlementTokenBalanceX10_18, int256 unrealizedPnlX10_18)
     {
+        // 获取待结算的资金费用
         int256 fundingPaymentX10_18 = IExchange(_exchange).getAllPendingFundingPayment(trader);
 
+        // 已实现盈亏
         int256 owedRealizedPnlX10_18;
+        // 作为maker获得的手续费
         uint256 pendingFeeX10_18;
         (owedRealizedPnlX10_18, unrealizedPnlX10_18, pendingFeeX10_18) = IAccountBalance(_accountBalance)
             .getPnlAndPendingFee(trader);
 
+        // 已结算的余额 = balance余额 + maker手续费 - 待结算的资金费 + 已实现盈亏
         settlementTokenBalanceX10_18 = getBalance(trader).parseSettlementToken(_decimals).add(
             pendingFeeX10_18.toInt256().sub(fundingPaymentX10_18).add(owedRealizedPnlX10_18)
         );
@@ -877,6 +963,7 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         return (settlementTokenBalanceX10_18, unrealizedPnlX10_18);
     }
 
+    // 获取结算token的价值，结算token的余额 + 未实现盈亏 ，
     /// @return settlementTokenValueX10_18 settlementTokenBalance + totalUnrealizedPnl, in 18 decimals
     function _getSettlementTokenValue(address trader) internal view returns (int256 settlementTokenValueX10_18) {
         (int256 settlementBalanceX10_18, int256 unrealizedPnlX10_18) =
@@ -884,6 +971,7 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
         return settlementBalanceX10_18.add(unrealizedPnlX10_18);
     }
 
+    //
     /// @return nonSettlementTokenValueX10_18 total non-settlement token value in 18 decimals
     function _getNonSettlementTokenValue(address trader) internal view returns (uint256 nonSettlementTokenValueX10_18) {
         address[] memory collateralTokens = _collateralTokensMap[trader];
@@ -953,6 +1041,8 @@ contract Vault is IVault, ReentrancyGuardUpgradeable, OwnerPausable, BaseRelayRe
                 );
     }
 
+    // 账号价值
+    // 所有抵押品价值
     function _getAccountValueAndTotalCollateralValue(address trader)
         internal
         view

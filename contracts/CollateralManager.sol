@@ -35,12 +35,12 @@ contract CollateralManager is ICollateralManager, OwnerPausable, CollateralManag
     function initialize(
         address clearingHouseConfigArg,
         address vaultArg,
-        uint8 maxCollateralTokensPerAccountArg,
+        uint8 maxCollateralTokensPerAccountArg,  // 每一个账号最大抵押token种类数量
         uint24 debtNonSettlementTokenValueRatioArg,
         uint24 liquidationRatioArg,
-        uint24 mmRatioBufferArg,
-        uint24 clInsuranceFundFeeRatioArg,
-        uint256 debtThresholdArg,
+        uint24 mmRatioBufferArg, // 这个用于抵押品清算，加上50个基点的缓冲，这个就是缓冲
+        uint24 clInsuranceFundFeeRatioArg, // 风险保证金费率
+        uint256 debtThresholdArg, // 负债阈值
         uint256 collateralValueDustArg
     )
         external

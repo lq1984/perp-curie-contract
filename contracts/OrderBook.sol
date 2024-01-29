@@ -107,6 +107,8 @@ contract OrderBook is
             bool initializedBeforeLower = UniswapV3Broker.getIsTickInitialized(pool, params.lowerTick);
             bool initializedBeforeUpper = UniswapV3Broker.getIsTickInitialized(pool, params.upperTick);
 
+            // 添加流动性
+
             // add liquidity to pool
             response = UniswapV3Broker.addLiquidity(
                 UniswapV3Broker.AddLiquidityParams(
@@ -146,6 +148,7 @@ contract OrderBook is
         }
 
         // state changes; if adding liquidity to an existing order, get fees accrued
+        // 更新/创建order状态
         uint256 fee =
             _addLiquidityToOrder(
                 InternalAddLiquidityToOrderParams({
@@ -166,7 +169,7 @@ contract OrderBook is
             AddLiquidityResponse({
                 base: response.base,
                 quote: response.quote,
-                fee: fee,
+                fee: fee, //累积的手续费？
                 liquidity: response.liquidity
             });
     }
@@ -260,13 +263,17 @@ contract OrderBook is
     function replaySwap(ReplaySwapParams memory params) external override returns (ReplaySwapResponse memory) {
         _requireOnlyExchange();
 
+        // 是否指定输入数量
         bool isExactInput = params.amount > 0;
+        // 手续费
         uint256 fee;
+        // 风险保证金
         uint256 insuranceFundFee; // insuranceFundFee = fee * insuranceFundFeeRatio
 
         UniswapV3Broker.SwapState memory swapState =
             UniswapV3Broker.getSwapState(params.pool, params.amount, _feeGrowthGlobalX128Map[params.baseToken]);
 
+        // 如果未指定价格限制，则使用默认的
         params.sqrtPriceLimitX96 = params.sqrtPriceLimitX96 == 0
             ? (params.isBaseToQuote ? TickMath.MIN_SQRT_RATIO + 1 : TickMath.MAX_SQRT_RATIO - 1)
             : params.sqrtPriceLimitX96;
@@ -275,12 +282,17 @@ contract OrderBook is
         // which is safer for the system
         int24 tickSpacing = UniswapV3Broker.getTickSpacing(params.pool);
 
+        // 这里是一个循环，如果还有数量需要撮合并且当前价格未达到限制价格时 才会继续撮合
+        // 这一块逻辑和uniswapV3 是一样的了...
         while (swapState.amountSpecifiedRemaining != 0 && swapState.sqrtPriceX96 != params.sqrtPriceLimitX96) {
             InternalSwapStep memory step;
+
+            // 当前价格
             step.initialSqrtPriceX96 = swapState.sqrtPriceX96;
 
             // find next tick
             // note the search is bounded in one word
+            // 遍历tickMap 获取下一个tick
             (step.nextTick, step.isNextTickInitialized) = UniswapV3Broker.getNextInitializedTickWithinOneWord(
                 params.pool,
                 swapState.tick,
@@ -289,6 +301,8 @@ contract OrderBook is
             );
 
             // ensure that we do not overshoot the min/max tick, as the tick bitmap is not aware of these bounds
+
+            // 确保tick不会越界
             if (step.nextTick < TickMath.MIN_TICK) {
                 step.nextTick = TickMath.MIN_TICK;
             } else if (step.nextTick > TickMath.MAX_TICK) {
@@ -297,10 +311,17 @@ contract OrderBook is
 
             // get the next price of this step (either next tick's price or the ending price)
             // use sqrtPrice instead of tick is more precise
+
+            // Tick 转换成 price
             step.nextSqrtPriceX96 = TickMath.getSqrtRatioAtTick(step.nextTick);
 
             // find the next swap checkpoint
             // (either reached the next price of this step, or exhausted remaining amount specified)
+            //
+            // state.sqrtPriceX96 撮合后的成交价
+            // step.amountIn \Delta In
+            // step.amountOut \Delta Out
+            // step.feeAmount 手续费
             (swapState.sqrtPriceX96, step.amountIn, step.amountOut, step.fee) = SwapMath.computeSwapStep(
                 swapState.sqrtPriceX96,
                 (
@@ -314,6 +335,9 @@ contract OrderBook is
                 swapState.amountSpecifiedRemaining,
                 // isBaseToQuote: fee is charged in base token in uniswap pool; thus, use uniswapFeeRatio to replay
                 // !isBaseToQuote: fee is charged in quote token in clearing house; thus, use exchangeFeeRatioRatio
+
+               // 如果是卖单，那么则使用uniswap的手续费率 扣除的手续费是base token
+               // 如果是买单，那么则使用交易所的手续费率 扣除的手续费是 quote token
                 params.isBaseToQuote ? params.uniswapFeeRatio : params.exchangeFeeRatio
             );
 
@@ -321,10 +345,12 @@ contract OrderBook is
             // quote token to uniswap ===> 1*0.98/0.99 = 0.98989899
             // fee = 0.98989899 * 2% = 0.01979798
             if (isExactInput) {
+                // 如果指定了输入大小，那么则可以计算剩余数量
                 swapState.amountSpecifiedRemaining = swapState.amountSpecifiedRemaining.sub(
                     step.amountIn.add(step.fee).toInt256()
                 );
             } else {
+                // 否则根据swap的结果来计算剩余要swap的数据量
                 swapState.amountSpecifiedRemaining = swapState.amountSpecifiedRemaining.add(step.amountOut.toInt256());
             }
 
@@ -332,19 +358,27 @@ contract OrderBook is
             // note CH only collects quote fee when swapping base -> quote
             if (swapState.liquidity > 0) {
                 if (params.isBaseToQuote) {
+                    // 如果是卖单，计算交易手续费 手续费收的是 quote Token
                     step.fee = FullMath.mulDivRoundingUp(step.amountOut, params.exchangeFeeRatio, 1e6);
                 }
 
                 fee += step.fee;
+
+                // 计算风险保证金
                 uint256 stepInsuranceFundFee = FullMath.mulDivRoundingUp(step.fee, params.insuranceFundFeeRatio, 1e6);
                 insuranceFundFee += stepInsuranceFundFee;
+
+                // 风险保证金是从手续费中按比例计算的
                 uint256 stepMakerFee = step.fee.sub(stepInsuranceFundFee);
+
+                // 计算每单位流动性对应的手续费
                 swapState.feeGrowthGlobalX128 += FullMath.mulDiv(stepMakerFee, FixedPoint128.Q128, swapState.liquidity);
             }
 
             if (swapState.sqrtPriceX96 == step.nextSqrtPriceX96) {
                 // we have reached the tick's boundary
                 if (step.isNextTickInitialized) {
+                    // 更新状态
                     if (params.shouldUpdateState) {
                         // update the tick if it has been initialized
                         mapping(int24 => Tick.GrowthInfo) storage tickMap = _growthOutsideTickMap[params.baseToken];
@@ -360,7 +394,10 @@ contract OrderBook is
                         );
                     }
 
+                    // 更新liquidityNet
                     int128 liquidityNet = UniswapV3Broker.getTickLiquidityNet(params.pool, step.nextTick);
+
+                    // 更新流动性
                     if (params.isBaseToQuote) liquidityNet = liquidityNet.neg128();
                     swapState.liquidity = LiquidityMath.addDelta(swapState.liquidity, liquidityNet);
                 }
@@ -418,6 +455,7 @@ contract OrderBook is
         return false;
     }
 
+    // 获取当地址对应所有限价订单可以的余额 与 为结算的uniswap 交易手续费
     /// @inheritdoc IOrderBook
     function getTotalQuoteBalanceAndPendingFee(address trader, address[] calldata baseTokens)
         external
@@ -435,6 +473,8 @@ contract OrderBook is
         return (totalQuoteAmountInPools, totalPendingFee);
     }
 
+    // 计算池子里面的流动性对应的token数量
+    // 以及池子中累积的手续费
     /// @inheritdoc IOrderBook
     function getTotalTokenAmountInPoolAndPendingFee(
         address trader,
@@ -570,6 +610,7 @@ contract OrderBook is
         uint256 feeGrowthInsideX128;
         (fee, feeGrowthInsideX128) = _getPendingFeeAndFeeGrowthInsideX128ByOrder(params.baseToken, openOrder);
 
+        // 按移除的流动性占总体流动性的比例去修改 baseDebt 和 quoteDebt
         if (params.liquidity != 0) {
             if (openOrder.baseDebt != 0) {
                 baseDebt = FullMath.mulDiv(openOrder.baseDebt, params.liquidity, openOrder.liquidity);
@@ -579,11 +620,14 @@ contract OrderBook is
                 quoteDebt = FullMath.mulDiv(openOrder.quoteDebt, params.liquidity, openOrder.liquidity);
                 openOrder.quoteDebt = openOrder.quoteDebt.sub(quoteDebt);
             }
+
+            // 更新流动性
             openOrder.liquidity = openOrder.liquidity.sub(params.liquidity).toUint128();
         }
 
         // after the fee is calculated, lastFeeGrowthInsideX128 can be updated if liquidity != 0 after removing
         if (openOrder.liquidity == 0) {
+            // 流动性为空，那就删掉该range order
             _removeOrder(params.maker, params.baseToken, params.orderId);
         } else {
             openOrder.lastFeeGrowthInsideX128 = feeGrowthInsideX128;
@@ -615,12 +659,30 @@ contract OrderBook is
 
     /// @dev this function is extracted from and only used by addLiquidity() to avoid stack too deep error
     function _addLiquidityToOrder(InternalAddLiquidityToOrderParams memory params) internal returns (uint256) {
+        // 这个和UniswapV3 的Position差不多
+        //    struct Info {
+        //        uint128 liquidity;  // 区间内的流动性
+        //        int24 lowerTick; // lower
+        //        int24 upperTick; // upper
+        //        uint256 lastFeeGrowthInsideX128; //
+        //        int256 lastTwPremiumGrowthInsideX96;
+        //        int256 lastTwPremiumGrowthBelowX96;
+        //        int256 lastTwPremiumDivBySqrtPriceGrowthInsideX96;
+        //        uint256 baseDebt; // 注入的base token数量
+        //        uint256 quoteDebt; // 注入的quote token 数量
+        //    }
+
+        // order id 生成规则:
+        // (owner,tokenPair,lower,upper)
         bytes32 orderId = OpenOrder.calcOrderKey(params.maker, params.baseToken, params.lowerTick, params.upperTick);
         // get the struct by key, no matter it's a new or existing order
         OpenOrder.Info storage openOrder = _openOrderMap[orderId];
 
         // initialization for a new order
         if (openOrder.liquidity == 0) {
+
+            // 创建新的订单
+
             bytes32[] storage orderIds = _openOrderIdsMap[params.maker][params.baseToken];
             // OB_ONE: orders number exceeds
             require(orderIds.length < IMarketRegistry(_marketRegistry).getMaxOrdersPerMarket(), "OB_ONE");
@@ -655,6 +717,8 @@ contract OrderBook is
         // after the fee is calculated, liquidity & lastFeeGrowthInsideX128 can be updated
         openOrder.liquidity = openOrder.liquidity.add(params.liquidity).toUint128();
         openOrder.lastFeeGrowthInsideX128 = feeGrowthInsideX128;
+
+        //
         openOrder.baseDebt = openOrder.baseDebt.add(params.base);
         openOrder.quoteDebt = openOrder.quoteDebt.add(params.quote);
 
@@ -679,6 +743,7 @@ contract OrderBook is
         return (totalBalanceFromOrders.toInt256().sub(totalOrderDebt.toInt256()), pendingFee);
     }
 
+    // 获取trader所有限价单 指定token数量总和
     /// @dev Get total amount of the specified tokens in the specified pool.
     ///      Note:
     ///        1. when querying quote amount, it includes Exchange fees, i.e.:
@@ -692,6 +757,7 @@ contract OrderBook is
         address baseToken, // this argument is only for specifying which pool to get base or quote amounts
         bool fetchBase // true: fetch base amount, false: fetch quote amount
     ) internal view returns (uint256 tokenAmount, uint256 pendingFee) {
+        // 所有id列表
         bytes32[] memory orderIds = _openOrderIdsMap[trader][baseToken];
 
         //
@@ -702,14 +768,19 @@ contract OrderBook is
         // if current price < upper tick, maker has base
         // case 1 : current price < lower tick
         //  --> maker only has base token
+        // 当前价格 > lower tick ， 池子里只剩下base token
         //
         // if current price > lower tick, maker has quote
         // case 2 : current price > upper tick
         //  --> maker only has quote token
+        // 当前价格 > upper tick ， 池子里只剩下quote token
+
+        // 查询最新价格
         (uint160 sqrtMarkPriceX96, , , , , , ) =
             UniswapV3Broker.getSlot0(IMarketRegistry(_marketRegistry).getPool(baseToken));
         uint256 orderIdLength = orderIds.length;
 
+        // 遍历每一个订单
         for (uint256 i = 0; i < orderIdLength; i++) {
             OpenOrder.Info memory order = _openOrderMap[orderIds[i]];
 
@@ -717,13 +788,18 @@ contract OrderBook is
             {
                 uint160 sqrtPriceAtLowerTick = TickMath.getSqrtRatioAtTick(order.lowerTick);
                 uint160 sqrtPriceAtUpperTick = TickMath.getSqrtRatioAtTick(order.upperTick);
+
                 if (fetchBase && sqrtMarkPriceX96 < sqrtPriceAtUpperTick) {
+
+                    // 计算池子中的base的数量
                     amount = LiquidityAmounts.getAmount0ForLiquidity(
                         sqrtMarkPriceX96 > sqrtPriceAtLowerTick ? sqrtMarkPriceX96 : sqrtPriceAtLowerTick,
                         sqrtPriceAtUpperTick,
                         order.liquidity
                     );
                 } else if (!fetchBase && sqrtMarkPriceX96 > sqrtPriceAtLowerTick) {
+
+                    // 计算池子中quote的数量
                     amount = LiquidityAmounts.getAmount1ForLiquidity(
                         sqrtPriceAtLowerTick,
                         sqrtMarkPriceX96 < sqrtPriceAtUpperTick ? sqrtMarkPriceX96 : sqrtPriceAtUpperTick,
@@ -733,6 +809,7 @@ contract OrderBook is
             }
             tokenAmount = tokenAmount.add(amount);
 
+            // 计算添加流动性累积的手续费
             // get uncollected fee (only quote)
             if (!fetchBase) {
                 (uint256 pendingFeeInOrder, ) = _getPendingFeeAndFeeGrowthInsideX128ByOrder(baseToken, order);
@@ -742,6 +819,7 @@ contract OrderBook is
         return (tokenAmount, pendingFee);
     }
 
+    // 获取添加流动性累积的手续费
     /// @dev CANNOT use safeMath for feeGrowthInside calculation, as it can be extremely large and overflow
     ///      the difference between two feeGrowthInside, however, is correct and won't be affected by overflow or not
     function _getPendingFeeAndFeeGrowthInsideX128ByOrder(address baseToken, OpenOrder.Info memory order)

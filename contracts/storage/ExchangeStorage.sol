@@ -7,7 +7,9 @@ import { Funding } from "../lib/Funding.sol";
 /// contract which implements ExchangeStorageV1 and following the naming convention
 /// ExchangeStorageVX.
 abstract contract ExchangeStorageV1 {
+    // 订单簿
     address internal _orderBook;
+    // 管理用户的持仓 xxx
     address internal _accountBalance;
     address internal _clearingHouseConfig;
 
@@ -15,6 +17,8 @@ abstract contract ExchangeStorageV1 {
     mapping(address => uint256) internal _firstTradedTimestampMap;
     // the last timestamp when funding is settled
     mapping(address => uint256) internal _lastSettledTimestampMap;
+
+    // 管理累积的资金费
     mapping(address => Funding.Growth) internal _globalFundingGrowthX96Map;
 
     // key: base token

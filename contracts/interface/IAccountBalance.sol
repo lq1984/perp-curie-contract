@@ -162,6 +162,7 @@ interface IAccountBalance {
         view
         returns (int256 marginRequirementForLiquidation);
 
+    // 获取trader的 已实现盈亏，以及未实现盈亏，以及maker pool中未结算的手续费
     /// @notice Get owedRealizedPnl, unrealizedPnl and pending fee
     /// @param trader The address of trader
     /// @return owedRealizedPnl the pnl realized already but stored temporarily in AccountBalance

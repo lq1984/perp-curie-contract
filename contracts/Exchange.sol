@@ -142,21 +142,39 @@ contract Exchange is
     /// @dev can only be called from ClearingHouse
     /// @inheritdoc IExchange
     function swap(SwapParams memory params) external override returns (SwapResponse memory) {
+        //   struct SwapParams {
+        //        address trader; // taker 地址
+        //        address baseToken; // base token 地址
+        //        bool isBaseToQuote; // true: 卖出订单 false: 买入订单
+        //        bool isExactInput; // 是否指定了输入token的数量
+        //        bool isClose; // 是否是平仓
+        //        uint256 amount; // 数量
+        //        uint160 sqrtPriceLimitX96; // 撮合成功后的价格限制，类似于滑点吧
+        //    }
+
         _requireOnlyClearingHouse();
 
         // EX_MIP: market is paused
         require(_maxTickCrossedWithinBlockMap[params.baseToken] > 0, "EX_MIP");
 
         // get account info before swap
+        // 获取持仓大小
         int256 takerPositionSize =
             IAccountBalance(_accountBalance).getTakerPositionSize(params.trader, params.baseToken);
 
+        // 获取开仓名义价值
         int256 takerOpenNotional =
             IAccountBalance(_accountBalance).getTakerOpenNotional(params.trader, params.baseToken);
 
+        // isBaseToQuote
+        // true: 卖出，做空
+        // false: 买入，做多
         bool isBaseToQuote = takerPositionSize < 0;
 
         if (params.isClose && takerPositionSize != 0) {
+            // 如果是平仓，并且持仓大小不为0 ，那就会创建反向订单
+            // 所以在这里需要修正价格限制
+
             // open reverse position when closing position
             params.sqrtPriceLimitX96 = _getSqrtPriceLimitForClosingPosition(
                 params.baseToken,
@@ -165,16 +183,21 @@ contract Exchange is
             );
         }
 
+        // 开始swap
         InternalSwapResponse memory response = _swap(params);
 
         // EX_OPLAS: over price limit after swap
         require(!_isOverPriceLimitWithTick(params.baseToken, response.tick), "EX_OPLAS");
 
         // when takerPositionSize < 0, it's a short position
+
+        // 是否是平仓
         bool isReducingPosition = takerPositionSize == 0 ? false : isBaseToQuote != params.isBaseToQuote;
+
         // when reducing/not increasing the position size, it's necessary to realize pnl
         int256 pnlToBeRealized;
         if (isReducingPosition) {
+            // 如果是减仓，那么则计算PNL
             pnlToBeRealized = _getPnlToBeRealized(
                 InternalRealizePnlParams({
                     trader: params.trader,
@@ -187,6 +210,7 @@ contract Exchange is
             );
         }
 
+        // 查询最新的价格
         (uint256 sqrtPriceX96, , , , , , ) =
             UniswapV3Broker.getSlot0(IMarketRegistry(_marketRegistry).getPool(params.baseToken));
 
@@ -196,6 +220,9 @@ contract Exchange is
             SwapResponse({
                 base: baseAbs,
                 quote: response.quote.abs(),
+
+                // long:  exchangedPositionSize >= 0 && exchangedPositionNotional <= 0
+                // short: exchangedPositionSize <= 0 && exchangedPositionNotional >= 0
                 exchangedPositionSize: response.exchangedPositionSize,
                 exchangedPositionNotional: response.exchangedPositionNotional,
                 fee: response.fee,
@@ -369,9 +396,11 @@ contract Exchange is
 
     /// @dev customized fee: https://www.notion.so/perp/Customise-fee-tier-on-B2QFee-1b7244e1db63416c8651e8fa04128cdb
     function _swap(SwapParams memory params) internal returns (InternalSwapResponse memory) {
+        // 获取交易对信息
         IMarketRegistry.MarketInfo memory marketInfo =
             IMarketRegistry(_marketRegistry).getMarketInfoByTrader(params.trader, params.baseToken);
 
+        // 根据手续费比例，对输入或者输出数量进行缩放，使其已经考虑 perp 手续费
         (uint256 scaledAmountForUniswapV3PoolSwap, int256 signedScaledAmountForReplaySwap) =
             SwapMath.calcScaledAmountForSwaps(
                 params.isBaseToQuote,
@@ -381,7 +410,10 @@ contract Exchange is
                 marketInfo.uniswapFeeRatio
             );
 
+        // 资金费率相关(暂时忽略)
         (Funding.Growth memory fundingGrowthGlobal, , ) = _getFundingGrowthGlobalAndTwaps(params.baseToken);
+
+        // 模拟交易,估算实际的swap手续费，以及风险保障金
         // simulate the swap to calculate the fees charged in exchange
         IOrderBook.ReplaySwapResponse memory replayResponse =
             IOrderBook(_orderBook).replaySwap(
@@ -401,28 +433,33 @@ contract Exchange is
 
         int256 priceSpreadRatioBeforeSwap = _getPriceSpreadRatio(params.baseToken, 0);
 
+        // 调用真正的swap进行撮合
         UniswapV3Broker.SwapResponse memory response =
             UniswapV3Broker.swap(
                 UniswapV3Broker.SwapParams(
                     marketInfo.pool,
                     _clearingHouse,
                     params.isBaseToQuote,
-                    params.isExactInput,
+                    params.isExactInput, // 是否指定输入数量
+
                     // mint extra base token before swap
                     scaledAmountForUniswapV3PoolSwap,
-                    params.sqrtPriceLimitX96,
+                    params.sqrtPriceLimitX96, // 价格限制
+
+                    // 定义swap回调数据
                     abi.encode(
                         SwapCallbackData({
                             trader: params.trader,
                             baseToken: params.baseToken,
-                            pool: marketInfo.pool,
-                            fee: replayResponse.fee,
-                            uniswapFeeRatio: marketInfo.uniswapFeeRatio
+                            pool: marketInfo.pool, // 对应的交易对
+                            fee: replayResponse.fee, // 计算的手续费
+                            uniswapFeeRatio: marketInfo.uniswapFeeRatio // uniswap 手续费率
                         })
                     )
                 )
             );
 
+        // 确保和模拟撮合结果一致
         int24 tick = UniswapV3Broker.getTick(marketInfo.pool);
         // tick mismatch
         require(tick == replayResponse.tick, "EX_TKMM");
@@ -439,19 +476,25 @@ contract Exchange is
             );
         }
 
+        //
+
         // as we charge fees in ClearingHouse instead of in Uniswap pools,
         // we need to scale up base or quote amounts to get the exact exchanged position size and notional
         int256 exchangedPositionSize;
         int256 exchangedPositionNotional;
         if (params.isBaseToQuote) {
+            // 卖出订单 做空订单
             // short: exchangedPositionSize <= 0 && exchangedPositionNotional >= 0
             exchangedPositionSize = SwapMath
                 .calcAmountScaledByFeeRatio(response.base, marketInfo.uniswapFeeRatio, false)
                 .neg256();
             // due to base to quote fee, exchangedPositionNotional contains the fee
             // s.t. we can take the fee away from exchangedPositionNotional
+
+            // 因为也是U本位，所以这里的开仓名义名义价值还是U
             exchangedPositionNotional = response.quote.toInt256();
         } else {
+            // 买入订单，做多订单
             // long: exchangedPositionSize >= 0 && exchangedPositionNotional <= 0
             exchangedPositionSize = response.base.toInt256();
 
@@ -468,6 +511,8 @@ contract Exchange is
                 // which is not matched with exact input 1000000000000000000000
                 // we modify exchangedPositionNotional here to make sure
                 // quote = exchangedPositionNotional - replayResponse.fee = exact input
+
+                // 开仓成本名义价值
                 exchangedPositionNotional = params.amount.sub(replayResponse.fee).toInt256().neg256();
             } else {
                 exchangedPositionNotional = SwapMath
@@ -663,13 +708,19 @@ contract Exchange is
         return spread.mulDiv(1e6, indexPrice);
     }
 
+    // 平仓时计算已实现盈亏
     function _getPnlToBeRealized(InternalRealizePnlParams memory params) internal pure returns (int256) {
         // closedRatio is based on the position size
+
+        // 计算平仓比例， 平仓数量 / 持仓数量
         uint256 closedRatio = FullMath.mulDiv(params.base.abs(), _FULLY_CLOSED_RATIO, params.takerPositionSize.abs());
 
         int256 pnlToBeRealized;
+
         // if closedRatio <= 1, it's reducing or closing a position; else, it's opening a larger reverse position
         if (closedRatio <= _FULLY_CLOSED_RATIO) {
+            // 平仓
+
             // https://docs.google.com/spreadsheets/d/1QwN_UZOiASv3dPBP7bNVdLR_GTaZGUrHW3-29ttMbLs/edit#gid=148137350
             // taker:
             // step 1: long 20 base
@@ -687,9 +738,16 @@ contract Exchange is
             // overflow inspection:
             // max closedRatio = 1e18; range of oldOpenNotional = (-2 ^ 255, 2 ^ 255)
             // only overflow when oldOpenNotional < -2 ^ 255 / 1e18 or oldOpenNotional > 2 ^ 255 / 1e18
+
+            // 通常情况下 PNL = (ClosePrice - EntryPrice) * CloseQuantity
+            // 展开之后: PNL = ClosePrice * CloseQuantity - EntryPrice * CloseQuantity
+            // 其中: EntryPrice * CloseQuantity = takerOpenNotional
+            //      quote = ClosePrice * CloseQuantity
             int256 reducedOpenNotional = params.takerOpenNotional.mulDiv(closedRatio.toInt256(), _FULLY_CLOSED_RATIO);
             pnlToBeRealized = params.quote.add(reducedOpenNotional);
         } else {
+            // 创建反向仓位
+
             // https://docs.google.com/spreadsheets/d/1QwN_UZOiASv3dPBP7bNVdLR_GTaZGUrHW3-29ttMbLs/edit#gid=668982944
             // taker:
             // step 1: long 20 base
@@ -708,6 +766,7 @@ contract Exchange is
             // overflow inspection:
             // max & min tick = 887272, -887272; max liquidity = 2 ^ 128
             // max quote = 2^128 * (sqrt(1.0001^887272) - sqrt(1.0001^-887272)) = 6.276865796e57 < 2^255 / 1e18
+
             int256 closedPositionNotional = params.quote.mulDiv(int256(_FULLY_CLOSED_RATIO), closedRatio);
             pnlToBeRealized = params.takerOpenNotional.add(closedPositionNotional);
         }
